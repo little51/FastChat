@@ -2,7 +2,8 @@
 Chat with a model with command line interface.
 
 Usage:
-python3 -m fastchat.serve.cli --model ~/model_weights/llama-7b
+python3 -m fastchat.serve.cli --model lmsys/fastchat-t5-3b-v1.0
+python3 -m fastchat.serve.cli --model ~/model_weights/vicuna-7b
 """
 import argparse
 import os
@@ -16,7 +17,8 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.live import Live
 
-from fastchat.serve.inference import chat_loop, ChatIO, add_model_args
+from fastchat.model.model_adapter import add_model_args
+from fastchat.serve.inference import chat_loop, ChatIO
 
 
 class SimpleChatIO(ChatIO):
@@ -29,13 +31,14 @@ class SimpleChatIO(ChatIO):
     def stream_output(self, output_stream):
         pre = 0
         for outputs in output_stream:
-            outputs = outputs.strip().split(" ")
-            now = len(outputs) - 1
+            output_text = outputs["text"]
+            output_text = output_text.strip().split(" ")
+            now = len(output_text) - 1
             if now > pre:
-                print(" ".join(outputs[pre:now]), end=" ", flush=True)
+                print(" ".join(output_text[pre:now]), end=" ", flush=True)
                 pre = now
-        print(" ".join(outputs[pre:]), flush=True)
-        return " ".join(outputs)
+        print(" ".join(output_text[pre:]), flush=True)
+        return " ".join(output_text)
 
 
 class RichChatIO(ChatIO):
@@ -72,6 +75,7 @@ class RichChatIO(ChatIO):
             for outputs in output_stream:
                 if not outputs:
                     continue
+                text = outputs["text"]
                 # Render the accumulated text as Markdown
                 # NOTE: this is a workaround for the rendering "unstandard markdown"
                 #  in rich. The chatbots output treat "\n" as a new line for
@@ -84,7 +88,7 @@ class RichChatIO(ChatIO):
                 #  especially for console output, because in general the console does not
                 #  care about trailing spaces.
                 lines = []
-                for line in outputs.splitlines():
+                for line in text.splitlines():
                     lines.append(line)
                     if line.startswith("```"):
                         # Code block marker - do not add trailing spaces, as it would
@@ -96,7 +100,7 @@ class RichChatIO(ChatIO):
                 # Update the Live console output
                 live.update(markdown)
         self._console.print()
-        return outputs
+        return text
 
 
 def main(args):

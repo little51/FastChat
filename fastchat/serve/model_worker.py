@@ -13,7 +13,7 @@ import threading
 import uuid
 
 from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import requests
 
 try:
@@ -33,9 +33,10 @@ except ImportError:
 import torch
 import uvicorn
 
-from fastchat.constants import WORKER_HEART_BEAT_INTERVAL
-from fastchat.serve.inference import load_model, generate_stream, add_model_args
-from fastchat.serve.serve_chatglm import chatglm_generate_stream
+from fastchat.constants import WORKER_HEART_BEAT_INTERVAL, ErrorCode
+from fastchat.model.model_adapter import load_model, add_model_args
+from fastchat.model.chatglm_model import chatglm_generate_stream
+from fastchat.serve.inference import generate_stream
 from fastchat.utils import build_logger, server_error_msg, pretty_print_semaphore
 
 GB = 1 << 30
@@ -88,6 +89,7 @@ class ModelWorker:
         else:
             self.context_len = 2048
 
+        # generate_stream
         is_chatglm = "chatglm" in str(type(self.model)).lower()
         if is_chatglm:
             self.generate_stream_func = chatglm_generate_stream
@@ -162,6 +164,17 @@ class ModelWorker:
             "queue_length": self.get_queue_length(),
         }
 
+    def count_token(self, params):
+        prompt = params["prompt"]
+        input_ids = self.tokenizer(prompt).input_ids
+        input_echo_len = len(input_ids)
+
+        ret = {
+            "count": input_echo_len,
+            "error_code": 0,
+        }
+        return ret
+
     def generate_stream_gate(self, params):
         try:
             for output in self.generate_stream_func(
@@ -173,16 +186,88 @@ class ModelWorker:
                 args.stream_interval,
             ):
                 ret = {
-                    "text": output,
+                    "text": output["text"],
                     "error_code": 0,
                 }
+                if "usage" in output:
+                    ret["usage"] = output["usage"]
+                if "finish_reason" in output:
+                    ret["finish_reason"] = output["finish_reason"]
+                if "logprobs" in output:
+                    ret["logprobs"] = output["logprobs"]
                 yield json.dumps(ret).encode() + b"\0"
-        except torch.cuda.OutOfMemoryError:
+        except torch.cuda.OutOfMemoryError as e:
             ret = {
-                "text": server_error_msg,
-                "error_code": 1,
+                "text": f"{server_error_msg}\n\n({e})",
+                "error_code": ErrorCode.CUDA_OUT_OF_MEMORY,
             }
             yield json.dumps(ret).encode() + b"\0"
+        except (ValueError, RuntimeError) as e:
+            ret = {
+                "text": f"{server_error_msg}\n\n({e})",
+                "error_code": ErrorCode.INTERNAL_ERROR,
+            }
+            yield json.dumps(ret).encode() + b"\0"
+
+    def generate_gate(self, params):
+        try:
+            ret = {"text": "", "error_code": 0}
+            for output in self.generate_stream_func(
+                self.model,
+                self.tokenizer,
+                params,
+                self.device,
+                self.context_len,
+                args.stream_interval,
+            ):
+                ret["text"] = output["text"]
+            if "usage" in output:
+                ret["usage"] = output["usage"]
+            if "finish_reason" in output:
+                ret["finish_reason"] = output["finish_reason"]
+            if "logprobs" in output:
+                ret["logprobs"] = output["logprobs"]
+        except torch.cuda.OutOfMemoryError as e:
+            ret = {
+                "text": f"{server_error_msg}\n\n({e})",
+                "error_code": ErrorCode.CUDA_OUT_OF_MEMORY,
+            }
+        except (ValueError, RuntimeError) as e:
+            ret = {
+                "text": f"{server_error_msg}\n\n({e})",
+                "error_code": ErrorCode.INTERNAL_ERROR,
+            }
+        return ret
+
+    @torch.inference_mode()
+    def get_embeddings(self, params):
+        try:
+            tokenizer = self.tokenizer
+            input_ids = tokenizer.encode(params["input"], return_tensors="pt").to(
+                self.device
+            )
+            model_output = self.model(input_ids, output_hidden_states=True)
+            is_chatglm = "chatglm" in str(type(self.model)).lower()
+            if is_chatglm:
+                data = (model_output.hidden_states[-1].transpose(0, 1))[0]
+            else:
+                data = model_output.hidden_states[-1][0]
+            embedding = torch.mean(data, dim=0)
+            ret = {
+                "embedding": embedding.tolist(),
+                "token_num": len(self.tokenizer(params["input"]).input_ids),
+            }
+        except torch.cuda.OutOfMemoryError as e:
+            ret = {
+                "text": f"{server_error_msg}\n\n({e})",
+                "error_code": ErrorCode.CUDA_OUT_OF_MEMORY,
+            }
+        except (ValueError, RuntimeError) as e:
+            ret = {
+                "text": f"{server_error_msg}\n\n({e})",
+                "error_code": ErrorCode.INTERNAL_ERROR,
+            }
+        return ret
 
 
 app = FastAPI()
@@ -192,24 +277,79 @@ def release_model_semaphore():
     model_semaphore.release()
 
 
-@app.post("/worker_generate_stream")
-async def api_generate_stream(request: Request):
+def acquire_model_semaphore():
     global model_semaphore, global_counter
     global_counter += 1
-    params = await request.json()
-
     if model_semaphore is None:
         model_semaphore = asyncio.Semaphore(args.limit_model_concurrency)
-    await model_semaphore.acquire()
-    generator = worker.generate_stream_gate(params)
+    return model_semaphore.acquire()
+
+
+def create_background_tasks():
     background_tasks = BackgroundTasks()
     background_tasks.add_task(release_model_semaphore)
+    return background_tasks
+
+
+@app.post("/worker_generate_stream")
+async def api_generate_stream(request: Request):
+    params = await request.json()
+    await acquire_model_semaphore()
+    generator = worker.generate_stream_gate(params)
+    background_tasks = create_background_tasks()
     return StreamingResponse(generator, background=background_tasks)
+
+
+@app.post("/worker_generate")
+async def api_generate(request: Request):
+    params = await request.json()
+    await acquire_model_semaphore()
+    output = worker.generate_gate(params)
+    release_model_semaphore()
+    return JSONResponse(output)
+
+
+@app.post("/worker_generate_completion_stream")
+async def api_generate_completion_stream(request: Request):
+    params = await request.json()
+    await acquire_model_semaphore()
+    generator = worker.generate_stream_gate(params)
+    background_tasks = create_background_tasks()
+    return StreamingResponse(generator, background=background_tasks)
+
+
+@app.post("/worker_generate_completion")
+async def api_generate_completion(request: Request):
+    params = await request.json()
+    await acquire_model_semaphore()
+    completion = worker.generate_gate(params)
+    background_tasks = create_background_tasks()
+    return JSONResponse(content=completion, background=background_tasks)
+
+
+@app.post("/worker_get_embeddings")
+async def api_get_embeddings(request: Request):
+    params = await request.json()
+    await acquire_model_semaphore()
+    embedding = worker.get_embeddings(params)
+    background_tasks = create_background_tasks()
+    return JSONResponse(content=embedding, background=background_tasks)
 
 
 @app.post("/worker_get_status")
 async def api_get_status(request: Request):
     return worker.get_status()
+
+
+@app.post("/count_token")
+async def count_token(request: Request):
+    params = await request.json()
+    return worker.count_token(params)
+
+
+@app.post("/model_details")
+async def model_details(request: Request):
+    return {"context_length": worker.context_len}
 
 
 if __name__ == "__main__":
@@ -230,9 +370,11 @@ if __name__ == "__main__":
 
     if args.gpus:
         if len(args.gpus.split(",")) < args.num_gpus:
-            raise ValueError(f"Larger --num-gpus ({args.num_gpus}) than --gpus {args.gpus}!")
+            raise ValueError(
+                f"Larger --num-gpus ({args.num_gpus}) than --gpus {args.gpus}!"
+            )
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
-    
+
     worker = ModelWorker(
         args.controller_address,
         args.worker_address,
