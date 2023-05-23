@@ -32,8 +32,7 @@ from fastchat.protocol.chat_completion import (
     ChatMessage,
     ChatCompletionResponseChoice,
 )
-from fastchat.conversation import get_default_conv_template, SeparatorStyle
-from fastchat.serve.inference import compute_skip_echo_len
+from fastchat.conversation import get_conv_template, SeparatorStyle
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +142,10 @@ def generate_payload(
     stop: Union[str, None],
 ):
     is_chatglm = "chatglm" in model_name.lower()
-    conv = get_default_conv_template(model_name).copy()
+    _model_name = model_name
+    if 'vicuna' in _model_name :
+        _model_name = 'vicuna_v1.1'
+    conv = get_conv_template(_model_name).copy()
 
     conv.messages = list(conv.messages)
 
@@ -165,10 +167,10 @@ def generate_payload(
         prompt = conv.messages[conv.offset:]
     else:
         prompt = conv.get_prompt()
-    skip_echo_len = compute_skip_echo_len(model_name, conv, prompt)
+    skip_echo_len = 0
 
     if stop is None:
-        stop = conv.sep if conv.sep_style == SeparatorStyle.SINGLE else conv.sep2
+        stop = conv.sep if conv.sep_style == SeparatorStyle.ADD_COLON_SINGLE else conv.sep2
 
     if max_tokens is None:
         max_tokens = 512
