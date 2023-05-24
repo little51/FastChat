@@ -121,6 +121,7 @@ zh - 中文
 ar - 阿拉伯语
 ru - 俄语
 pt - 葡萄牙语
+nl - 荷兰语
 ```
 
 ### 3.5 将长会话切分成短对话
@@ -154,7 +155,7 @@ fastchat/train/train_mem.py \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
-    --fsdp "full_shard auto_wrap" \
+    --fsdp "no_shard" \
     --fsdp_transformer_layer_cls_to_wrap 'LlamaDecoderLayer' \
     --model_max_length 2048 \
     --gradient_checkpointing True \
@@ -188,6 +189,53 @@ deepspeed fastchat/train/train_lora.py \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --model_max_length 2048
-
 ```
+
+### 4.3 T5模型
+
+```bash
+mkdir google
+cd google
+git clone https://huggingface.co/google/flan-t5-xl
+CUDA_VISIBLE_DEVICES=1 \
+torchrun --nproc_per_node=1 --master_port=20001 \
+	fastchat/train/train_flant5.py \
+    --model_name_or_path ./opt-125m \
+    --data_path ./fine-tuning/data/sharegpt52k/sharegpt_clean_split.json \
+    --output_dir ./fine-tuning/output \
+    --num_train_epochs 3 \
+    --per_device_train_batch_size 1 \
+    --per_device_eval_batch_size 1 \
+    --gradient_accumulation_steps 4 \
+    --evaluation_strategy "no" \
+    --save_strategy "steps" \
+    --save_steps 300 \
+    --save_total_limit 1 \
+    --learning_rate 2e-5 \
+    --weight_decay 0. \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type "cosine" \
+    --logging_steps 1 \
+    --fsdp "full_shard auto_wrap" \
+    --fsdp_transformer_layer_cls_to_wrap T5Block \
+    --model_max_length 2048 \
+    --preprocessed_path ./preprocessed_data/processed.json \
+    --gradient_checkpointing True
+```
+
+
+
+## 参考
+
+https://github.com/lm-sys/FastChat/pull/177
+
+https://github.com/h2oai/h2ogpt/pull/86
+
+https://github.com/lm-sys/FastChat/issues/608
+
+https://zhuanlan.zhihu.com/p/618073170
+
+https://zhuanlan.zhihu.com/p/617221484
+
+
 
