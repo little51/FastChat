@@ -63,8 +63,7 @@ def removeTimeoutBuffer():
                 print(key + "：sign as stop")
 
 
-@app.post("/v1/chat/completions/stream")
-async def create_chat_completion_stream(request: ChatCompletionRequest):
+def docreate_chat_completion_stream(request: ChatCompletionRequest):
     removeTimeoutBuffer()
     global stream_buffer
     msgid = request.messages[-1]["content"]
@@ -95,6 +94,19 @@ async def create_chat_completion_stream(request: ChatCompletionRequest):
         "time": time
     }
     return answer
+
+
+@app.post("/v1/chat/completions/stream")
+async def create_chat_completion_stream(request: ChatCompletionRequest):
+    try:
+        return docreate_chat_completion_stream(request)
+    except:
+        return {
+            "response": "",
+            "history": [],
+            "status": 403,
+            "time": 0
+        }
 
 
 def stream_item(model, messages):
@@ -143,7 +155,7 @@ def generate_payload(
 ):
     is_chatglm = "chatglm" in model_name.lower()
     _model_name = model_name
-    if 'vicuna' in _model_name :
+    if 'vicuna' in _model_name:
         _model_name = 'vicuna_v1.1'
     conv = get_conv_template(_model_name).copy()
 
